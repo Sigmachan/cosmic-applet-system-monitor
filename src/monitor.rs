@@ -18,6 +18,9 @@ pub struct SystemStats {
     pub ram_used_gb: f32,
     pub ram_total_gb: f32,
     pub ram_percent: f32,
+    pub swap_used_gb: f32,
+    pub swap_total_gb: f32,
+    pub swap_percent: f32,
     pub gpus: Vec<GpuStats>,
 }
 
@@ -369,6 +372,9 @@ impl SystemMonitor {
         let total = self.sys.total_memory();
         let used = self.sys.used_memory();
 
+        let swap_total = self.sys.total_swap();
+        let swap_used = self.sys.used_swap();
+
         let mut gpus: Vec<GpuStats> = self.sysfs_gpus.iter().map(SysfsGpu::stats).collect();
         #[cfg(feature = "nvidia")]
         if let Some(nvml) = &self.nvml_gpus {
@@ -382,6 +388,9 @@ impl SystemMonitor {
             ram_used_gb: used as f32 / BYTES_PER_GIB,
             ram_total_gb: total as f32 / BYTES_PER_GIB,
             ram_percent: percent_of(used, total),
+            swap_used_gb: swap_used as f32 / BYTES_PER_GIB,
+            swap_total_gb: swap_total as f32 / BYTES_PER_GIB,
+            swap_percent: percent_of(swap_used, swap_total),
             gpus,
         }
     }
