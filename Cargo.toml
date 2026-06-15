@@ -1,0 +1,25 @@
+[package]
+name = "cosmic-applet-system-monitor"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "tokio",
+    "wayland",
+    "winit",
+    "process",
+] }
+sysinfo = "0.33"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "thin"

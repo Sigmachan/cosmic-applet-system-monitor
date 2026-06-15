@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=System Monitor
+Comment=CPU, GPU and RAM usage monitor
+Type=Application
+Exec=cosmic-applet-system-monitor
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;System;Monitor;CPU;GPU;RAM;
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-OverflowPriority=10
