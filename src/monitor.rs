@@ -203,11 +203,20 @@ impl NvmlGpus {
         let count = nvml.device_count().unwrap_or(0);
         let mut devices = Vec::new();
         for index in 0..count {
+            // NVML names already include the brand (e.g. "NVIDIA GeForce RTX
+            // 5090"), so only prefix when they don't to avoid "NVIDIA NVIDIA …".
             let name = nvml
                 .device_by_index(index)
                 .and_then(|d| d.name())
+                .map(|n| {
+                    if n.to_ascii_lowercase().contains("nvidia") {
+                        n
+                    } else {
+                        format!("NVIDIA {n}")
+                    }
+                })
                 .unwrap_or_else(|_| format!("NVIDIA #{index}"));
-            devices.push((index, format!("NVIDIA {name}")));
+            devices.push((index, name));
         }
 
         if devices.is_empty() {
