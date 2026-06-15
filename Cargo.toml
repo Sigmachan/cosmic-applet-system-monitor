@@ -1,8 +1,20 @@
 [package]
 name = "cosmic-applet-system-monitor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 license = "GPL-3.0-only"
+description = "COSMIC panel applet displaying CPU, GPU and RAM usage"
+repository = "https://github.com/merclamp/cosmic-applet-system-monitor"
+readme = "README.md"
+categories = ["gui"]
+keywords = ["cosmic", "applet", "monitor", "system", "gpu"]
+
+[features]
+default = ["nvidia"]
+# NVIDIA GPU usage/temperature via NVML (requires libnvidia-ml at runtime;
+# absence is handled gracefully). Disable for a pure-sysfs build.
+nvidia = ["dep:nvml-wrapper"]
 
 [dependencies]
 libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
@@ -14,12 +26,14 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = fa
     "process",
 ] }
 sysinfo = "0.33"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
+nvml-wrapper = { version = "0.10", optional = true }
 
 [profile.release]
 opt-level = 3
 panic = "abort"
 lto = "thin"
+strip = true

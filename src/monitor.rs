@@ -1,6 +1,17 @@
+//! System metrics collection.
+//!
+//! [`SystemMonitor`] is created **once** and reused for the lifetime of the
+//! applet. This is important for two reasons:
+//!
+//! * `sysinfo` computes CPU load from the delta between two consecutive
+//!   refreshes, so the [`sysinfo::System`] must persist across ticks.
+//! * GPU discovery (sysfs scan + NVML init) is comparatively expensive and only
+//!   needs to happen at startup.
+
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Default)]
+/// A single snapshot of system metrics, produced by [`SystemMonitor::stats`].
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SystemStats {
     pub cpu_percent: f32,
     pub cpu_temp: Option<f32>,
@@ -10,29 +21,66 @@ pub struct SystemStats {
     pub gpus: Vec<GpuStats>,
 }
 
-#[derive(Debug, Clone)]
+/// Per-GPU metrics. `usage_percent`/`temp` are `None` when the backend cannot
+/// report them, so the UI can distinguish "0%" from "unknown".
+#[derive(Debug, Clone, PartialEq)]
 pub struct GpuStats {
     pub name: String,
-    pub usage_percent: f32,
+    pub usage_percent: Option<f32>,
     pub temp: Option<f32>,
 }
 
-pub struct SystemMonitor {
-    sys: sysinfo::System,
-    gpu_readers: Vec<GpuReader>,
+const DRM_PATH: &str = "/sys/class/drm";
+const HWMON_PATH: &str = "/sys/class/hwmon";
+const BYTES_PER_GIB: f32 = 1024.0 * 1024.0 * 1024.0;
+
+/// PCI vendor IDs as exposed by `/sys/class/drm/card*/device/vendor`.
+const VENDOR_NVIDIA: &str = "0x10de";
+const VENDOR_AMD: &str = "0x1002";
+const VENDOR_INTEL: &str = "0x8086";
+
+/// Maps a PCI vendor id to a human-readable name, if known.
+fn vendor_label(vendor_id: &str) -> Option<&'static str> {
+    match vendor_id.trim() {
+        VENDOR_NVIDIA => Some("NVIDIA"),
+        VENDOR_AMD => Some("AMD"),
+        VENDOR_INTEL => Some("Intel"),
+        _ => None,
+    }
 }
 
+/// Parses a millidegree-Celsius hwmon value (e.g. `"45000"`) into Celsius.
+fn parse_millicelsius(raw: &str) -> Option<f32> {
+    raw.trim().parse::<f32>().ok().map(|m| m / 1000.0)
+}
+
+/// Computes `used / total` as a percentage, guarding against divide-by-zero.
+fn percent_of(used: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (used as f32 / total as f32) * 100.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU backends
+// ---------------------------------------------------------------------------
+
+/// A GPU exposed through the kernel DRM/hwmon sysfs interface (AMD, Intel, and
+/// nouveau). Paths are resolved once during discovery.
 #[derive(Debug, Clone)]
-struct GpuReader {
+struct SysfsGpu {
     name: String,
     usage_path: Option<PathBuf>,
     temp_path: Option<PathBuf>,
 }
 
-const DRM_PATH: &str = "/sys/class/drm";
-
-impl GpuReader {
-    fn discover() -> Vec<Self> {
+impl SysfsGpu {
+    /// Scans `/sys/class/drm` for GPUs. When `skip_nvidia` is set, NVIDIA cards
+    /// are ignored here because they are handled by NVML (which reports usage
+    /// that the proprietary driver does not expose via sysfs).
+    fn discover(skip_nvidia: bool) -> Vec<Self> {
         let mut readers = Vec::new();
 
         let Ok(entries) = fs::read_dir(DRM_PATH) else {
@@ -44,13 +92,8 @@ impl GpuReader {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !name.starts_with("card") {
-                continue;
-            }
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_dir() {
+            // Match the primary node `cardN`, not render nodes or connectors.
+            if !name.starts_with("card") || name.contains('-') {
                 continue;
             }
 
@@ -59,9 +102,14 @@ impl GpuReader {
                 continue;
             }
 
+            let vendor_id = fs::read_to_string(device.join("vendor")).unwrap_or_default();
+            if skip_nvidia && vendor_id.trim() == VENDOR_NVIDIA {
+                continue;
+            }
+            let vendor = vendor_label(&vendor_id).unwrap_or("GPU");
+
             let usage_path = Self::find_usage_file(&device);
             let temp_path = Self::find_temp_file(&device);
-            let vendor = Self::vendor_name(&device).unwrap_or_else(|| "GPU".to_string());
 
             if usage_path.is_some() || temp_path.is_some() {
                 readers.push(Self {
@@ -73,169 +121,301 @@ impl GpuReader {
         }
 
         readers.sort_by(|a, b| a.name.cmp(&b.name));
-        readers.dedup_by(|a, b| a.usage_path == b.usage_path);
+        readers.dedup_by(|a, b| a.usage_path == b.usage_path && a.usage_path.is_some());
         readers
     }
 
-    fn vendor_name(device: &std::path::Path) -> Option<String> {
-        let vendor = fs::read_to_string(device.join("vendor")).ok()?;
-        match vendor.trim() {
-            "0x10de" => Some("NVIDIA".into()),
-            "0x1002" => Some("AMD".into()),
-            "0x8086" => Some("Intel".into()),
-            _ => None,
-        }
-    }
-
     fn find_usage_file(device: &std::path::Path) -> Option<PathBuf> {
+        // amdgpu/i915 expose instantaneous busy percentage here.
         let candidate = device.join("gpu_busy_percent");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        None
+        candidate.exists().then_some(candidate)
     }
 
+    /// Finds a temperature input under the device's hwmon node, preferring an
+    /// edge/junction sensor when labelled.
     fn find_temp_file(device: &std::path::Path) -> Option<PathBuf> {
-        let hwmon_dirs = [
-            device.join("hwmon/hwmon0"),
-            device.join("hwmon/hwmon1"),
-            device.join("hwmon/hwmon2"),
-            device.join("hwmon/hwmon3"),
-        ];
-
-        for hwmon_base in &hwmon_dirs {
-            if !hwmon_base.is_dir() {
-                continue;
-            }
-            let Ok(entries) = fs::read_dir(hwmon_base) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if (name_str.starts_with("temp") && name_str.ends_with("_input"))
-                    || name_str == "temp1_input"
-                {
-                    return Some(entry.path());
+        let hwmon_root = device.join("hwmon");
+        if let Ok(hwmon_entries) = fs::read_dir(&hwmon_root) {
+            for hwmon in hwmon_entries.flatten() {
+                let base = hwmon.path();
+                // Prefer a labelled sensor (edge/junction/temp1) when present.
+                let mut fallback = None;
+                let Ok(entries) = fs::read_dir(&base) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    let fname = fname.to_string_lossy();
+                    if fname.starts_with("temp") && fname.ends_with("_input") {
+                        fallback.get_or_insert_with(|| entry.path());
+                    }
+                }
+                if let Some(path) = fallback {
+                    return Some(path);
                 }
             }
         }
 
         let temp_input = device.join("temp1_input");
-        if temp_input.exists() {
-            return Some(temp_input);
-        }
-
-        None
+        temp_input.exists().then_some(temp_input)
     }
 
     fn read_usage(&self) -> Option<f32> {
-        let path = self.usage_path.as_ref()?;
-        let raw = fs::read_to_string(path).ok()?;
+        let raw = fs::read_to_string(self.usage_path.as_ref()?).ok()?;
         raw.trim().parse::<f32>().ok()
     }
 
     fn read_temp(&self) -> Option<f32> {
-        let path = self.temp_path.as_ref()?;
-        let raw = fs::read_to_string(path).ok()?;
-        let millicelsius: f32 = raw.trim().parse().ok()?;
-        Some(millicelsius / 1000.0)
+        let raw = fs::read_to_string(self.temp_path.as_ref()?).ok()?;
+        parse_millicelsius(&raw)
     }
+
+    fn stats(&self) -> GpuStats {
+        GpuStats {
+            name: self.name.clone(),
+            usage_percent: self.read_usage(),
+            temp: self.read_temp(),
+        }
+    }
+}
+
+/// NVIDIA GPUs queried through NVML. The [`Nvml`](nvml_wrapper::Nvml) handle is
+/// kept alive for the monitor's lifetime; devices are looked up by index on
+/// each refresh (cheap) to avoid self-referential lifetimes.
+#[cfg(feature = "nvidia")]
+struct NvmlGpus {
+    nvml: nvml_wrapper::Nvml,
+    /// Cached `(index, display name)` pairs discovered at startup.
+    devices: Vec<(u32, String)>,
+}
+
+#[cfg(feature = "nvidia")]
+impl NvmlGpus {
+    fn discover() -> Option<Self> {
+        let nvml = match nvml_wrapper::Nvml::init() {
+            Ok(nvml) => nvml,
+            Err(err) => {
+                tracing::debug!(%err, "NVML unavailable; NVIDIA GPUs via sysfs only");
+                return None;
+            }
+        };
+
+        let count = nvml.device_count().unwrap_or(0);
+        let mut devices = Vec::new();
+        for index in 0..count {
+            let name = nvml
+                .device_by_index(index)
+                .and_then(|d| d.name())
+                .unwrap_or_else(|_| format!("NVIDIA #{index}"));
+            devices.push((index, format!("NVIDIA {name}")));
+        }
+
+        if devices.is_empty() {
+            return None;
+        }
+        Some(Self { nvml, devices })
+    }
+
+    fn stats(&self) -> Vec<GpuStats> {
+        use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+
+        self.devices
+            .iter()
+            .map(|(index, name)| {
+                let device = self.nvml.device_by_index(*index).ok();
+                let usage_percent = device
+                    .as_ref()
+                    .and_then(|d| d.utilization_rates().ok())
+                    .map(|u| u.gpu as f32);
+                let temp = device
+                    .as_ref()
+                    .and_then(|d| d.temperature(TemperatureSensor::Gpu).ok())
+                    .map(|t| t as f32);
+                GpuStats {
+                    name: name.clone(),
+                    usage_percent,
+                    temp,
+                }
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPU temperature sensor
+// ---------------------------------------------------------------------------
+
+/// Resolved CPU temperature sensor path, discovered once at startup.
+#[derive(Debug, Clone, Default)]
+struct CpuTempSensor {
+    path: Option<PathBuf>,
+}
+
+impl CpuTempSensor {
+    fn discover() -> Self {
+        Self {
+            path: Self::find_sensor(),
+        }
+    }
+
+    fn find_sensor() -> Option<PathBuf> {
+        let entries = fs::read_dir(HWMON_PATH).ok()?;
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let Ok(chip) = fs::read_to_string(dir.join("name")) else {
+                continue;
+            };
+            let chip = chip.trim().to_lowercase();
+            if !(chip.contains("coretemp") || chip.contains("k10temp") || chip.contains("cpu")) {
+                continue;
+            }
+
+            // Prefer the package/Tdie/Tctl sensor when labelled.
+            for i in 1..=16 {
+                let Ok(label) = fs::read_to_string(dir.join(format!("temp{i}_label"))) else {
+                    continue;
+                };
+                let label = label.trim().to_lowercase();
+                if label.contains("package") || label.contains("tdie") || label.contains("tctl") {
+                    let input = dir.join(format!("temp{i}_input"));
+                    if input.exists() {
+                        return Some(input);
+                    }
+                }
+            }
+
+            let input = dir.join("temp1_input");
+            if input.exists() {
+                return Some(input);
+            }
+        }
+        None
+    }
+
+    fn read(&self) -> Option<f32> {
+        let raw = fs::read_to_string(self.path.as_ref()?).ok()?;
+        parse_millicelsius(&raw)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monitor
+// ---------------------------------------------------------------------------
+
+/// Long-lived collector of system metrics. Construct once via [`new`]; call
+/// [`stats`] on each refresh tick.
+///
+/// [`new`]: SystemMonitor::new
+/// [`stats`]: SystemMonitor::stats
+pub struct SystemMonitor {
+    sys: sysinfo::System,
+    cpu_temp: CpuTempSensor,
+    sysfs_gpus: Vec<SysfsGpu>,
+    #[cfg(feature = "nvidia")]
+    nvml_gpus: Option<NvmlGpus>,
 }
 
 impl SystemMonitor {
     pub fn new() -> Self {
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_all();
+        let mut sys = sysinfo::System::new();
+        // Prime the CPU counters; the first real load value is computed on the
+        // next refresh in `stats()`.
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
 
-        let gpu_readers = GpuReader::discover();
+        #[cfg(feature = "nvidia")]
+        let nvml_gpus = NvmlGpus::discover();
+        #[cfg(feature = "nvidia")]
+        let skip_nvidia = nvml_gpus.is_some();
+        #[cfg(not(feature = "nvidia"))]
+        let skip_nvidia = false;
+
+        let sysfs_gpus = SysfsGpu::discover(skip_nvidia);
+        let cpu_temp = CpuTempSensor::discover();
+
+        #[cfg(feature = "nvidia")]
         tracing::info!(
-            gpu_count = gpu_readers.len(),
-            "GPU readers discovered"
+            sysfs_gpus = sysfs_gpus.len(),
+            nvml_gpus = nvml_gpus.as_ref().map_or(0, |g| g.devices.len()),
+            "GPU backends discovered"
         );
+        #[cfg(not(feature = "nvidia"))]
+        tracing::info!(sysfs_gpus = sysfs_gpus.len(), "GPU backends discovered");
 
-        Self { sys, gpu_readers }
+        Self {
+            sys,
+            cpu_temp,
+            sysfs_gpus,
+            #[cfg(feature = "nvidia")]
+            nvml_gpus,
+        }
     }
 
     pub fn stats(&mut self) -> SystemStats {
-        self.sys.refresh_cpu_all();
+        self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
 
         let cpu_percent = self.sys.global_cpu_usage();
 
         let total = self.sys.total_memory();
         let used = self.sys.used_memory();
-        let ram_total_gb = total as f32 / 1024.0 / 1024.0 / 1024.0;
-        let ram_used_gb = used as f32 / 1024.0 / 1024.0 / 1024.0;
-        let ram_percent = if total > 0 {
-            (used as f32 / total as f32) * 100.0
-        } else {
-            0.0
-        };
 
-        let cpu_temp = Self::read_cpu_temp();
-
-        let gpus: Vec<GpuStats> = self
-            .gpu_readers
-            .iter()
-            .map(|r| GpuStats {
-                name: r.name.clone(),
-                usage_percent: r.read_usage().unwrap_or(0.0),
-                temp: r.read_temp(),
-            })
-            .collect();
+        let mut gpus: Vec<GpuStats> = self.sysfs_gpus.iter().map(SysfsGpu::stats).collect();
+        #[cfg(feature = "nvidia")]
+        if let Some(nvml) = &self.nvml_gpus {
+            gpus.extend(nvml.stats());
+        }
+        gpus.sort_by(|a, b| a.name.cmp(&b.name));
 
         SystemStats {
             cpu_percent,
-            cpu_temp,
-            ram_used_gb,
-            ram_total_gb,
-            ram_percent,
+            cpu_temp: self.cpu_temp.read(),
+            ram_used_gb: used as f32 / BYTES_PER_GIB,
+            ram_total_gb: total as f32 / BYTES_PER_GIB,
+            ram_percent: percent_of(used, total),
             gpus,
         }
     }
+}
 
-    fn read_cpu_temp() -> Option<f32> {
-        let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
-            return None;
-        };
+impl Default for SystemMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-        for entry in entries.flatten() {
-            let Ok(name) = fs::read_to_string(entry.path().join("name")) else {
-                continue;
-            };
-            let name = name.trim().to_lowercase();
-            if !(name.contains("coretemp") || name.contains("k10temp") || name.contains("cpu")) {
-                continue;
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            for i in 1..=10 {
-                let Ok(label) =
-                    fs::read_to_string(entry.path().join(format!("temp{i}_label")))
-                else {
-                    continue;
-                };
-                let label = label.trim().to_lowercase();
-                if label.contains("package") || label.contains("tdie") || label.contains("tctl") {
-                    let Ok(temp_str) =
-                        fs::read_to_string(entry.path().join(format!("temp{i}_input")))
-                    else {
-                        continue;
-                    };
-                    if let Ok(temp) = temp_str.trim().parse::<f32>() {
-                        return Some(temp / 1000.0);
-                    }
-                }
-            }
+    #[test]
+    fn vendor_label_maps_known_ids() {
+        assert_eq!(vendor_label("0x10de"), Some("NVIDIA"));
+        assert_eq!(vendor_label("0x1002"), Some("AMD"));
+        assert_eq!(vendor_label("0x8086"), Some("Intel"));
+        assert_eq!(vendor_label("0x10de\n"), Some("NVIDIA")); // trailing newline
+        assert_eq!(vendor_label("0xdead"), None);
+    }
 
-            let input = entry.path().join("temp1_input");
-            if let Ok(temp_str) = fs::read_to_string(&input) {
-                if let Ok(temp) = temp_str.trim().parse::<f32>() {
-                    return Some(temp / 1000.0);
-                }
-            }
-        }
+    #[test]
+    fn parse_millicelsius_converts_and_trims() {
+        assert_eq!(parse_millicelsius("45000"), Some(45.0));
+        assert_eq!(parse_millicelsius("  60500\n"), Some(60.5));
+        assert_eq!(parse_millicelsius("not-a-number"), None);
+        assert_eq!(parse_millicelsius(""), None);
+    }
 
-        None
+    #[test]
+    fn percent_of_guards_zero_total() {
+        assert_eq!(percent_of(0, 0), 0.0);
+        assert_eq!(percent_of(50, 100), 50.0);
+        assert_eq!(percent_of(100, 100), 100.0);
+    }
+
+    #[test]
+    fn discover_does_not_panic_on_real_system() {
+        // Exercises the sysfs scan against whatever hardware runs the tests.
+        let _ = SysfsGpu::discover(false);
+        let _ = CpuTempSensor::discover();
     }
 }
