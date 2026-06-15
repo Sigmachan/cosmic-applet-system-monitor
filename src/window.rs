@@ -118,6 +118,10 @@ impl Window {
             format!("RAM:{:3.0}%", self.stats.ram_percent),
         ];
 
+        if self.stats.swap_total_gb > 0.0 {
+            parts.push(format!("SWAP:{:3.0}%", self.stats.swap_percent));
+        }
+
         if self.stats.gpus.is_empty() {
             parts.push("GPU: --".to_string());
         } else {
@@ -235,6 +239,18 @@ impl cosmic::Application for Window {
             metric_row("memory-symbolic", "RAM", ram_text),
             container(progress_bar(self.stats.ram_percent)).padding([0, 12, 0, 44]),
         ];
+
+        if self.stats.swap_total_gb > 0.0 {
+            let swap_text = format!(
+                "{:.1} / {:.1} GB  ({:.0}%)",
+                self.stats.swap_used_gb, self.stats.swap_total_gb, self.stats.swap_percent
+            );
+            content = content
+                .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+            content = content.push(metric_row("drive-harddisk-symbolic", "SWAP", swap_text));
+            content = content
+                .push(container(progress_bar(self.stats.swap_percent)).padding([0, 12, 0, 44]));
+        }
 
         if !self.stats.gpus.is_empty() {
             content = content
