@@ -9,5 +9,3 @@ Keywords=COSMIC;Applet;System;Monitor;CPU;GPU;RAM;
 StartupNotify=true
 NoDisplay=true
 X-CosmicApplet=true
-X-CosmicShrinkable=true
-X-OverflowPriority=10
