@@ -1,19 +1,33 @@
 # cosmic-applet-system-monitor
 
-Applet for the [COSMIC desktop](https://github.com/pop-os/cosmic-epoch) panel that displays CPU, GPU load and RAM usage.
+Applet for the [COSMIC desktop](https://github.com/pop-os/cosmic-epoch) panel
+that displays CPU, GPU and RAM usage at a glance, with a detailed popup.
 
 ## Features
 
-- CPU usage percentage and temperature
-- RAM used/total (GB) and percentage
-- GPU usage and temperature (NVIDIA, AMD, Intel via DRM sysfs)
-- Click to open detailed popup with progress bars
-- Updates every 2 seconds
+- **CPU** — usage percentage and package temperature
+- **RAM** — used/total (GiB) and percentage
+- **GPU** — usage and temperature, with **multi-GPU support**:
+  - **NVIDIA** via [NVML] (real utilisation + temperature, including GPUs the
+    proprietary driver does not expose through sysfs)
+  - **AMD / Intel** via the kernel DRM/hwmon sysfs interface
+    (`gpu_busy_percent`, hwmon `temp*_input`)
+- Click the panel entry for a detailed popup with progress bars
+- Refreshes every 2 seconds
+
+On a hybrid system (e.g. an NVIDIA discrete GPU plus an AMD/Intel iGPU) **both
+GPUs are listed**.
+
+[NVML]: https://developer.nvidia.com/nvidia-management-library-nvml
 
 ## Requirements
 
 - COSMIC desktop environment
-- Rust toolchain (rustc 1.96+, cargo)
+- Rust toolchain (1.85+, edition 2024)
+- Build deps: `libwayland`, `libxkbcommon`, `libudev`, `pkg-config`
+- *(optional, runtime)* `libnvidia-ml` for NVIDIA GPU stats — absence is handled
+  gracefully (NVIDIA cards simply fall back to sysfs temperature, or are hidden
+  if they expose nothing)
 
 ## Build
 
@@ -21,27 +35,51 @@ Applet for the [COSMIC desktop](https://github.com/pop-os/cosmic-epoch) panel th
 cargo build --release
 ```
 
+NVIDIA/NVML support is on by default. For a pure-sysfs build (no NVML link):
+
+```bash
+cargo build --release --no-default-features
+```
+
 ## Install
 
-```bash
-sudo cp target/release/cosmic-applet-system-monitor /usr/bin/
-sudo cp resources/com.system76.CosmicAppletSystemMonitor.desktop /usr/share/applications/
-```
-
-Then add `com.system76.CosmicAppletSystemMonitor` to the panel config at
-`~/.config/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings`
-and restart the panel:
+Using [`just`](https://github.com/casey/just):
 
 ```bash
-pkill cosmic-panel && cosmic-panel &
+just install   # builds, installs binary + desktop entry (sudo)
 ```
 
-## How it works
+Or manually:
 
-- **CPU**: load via `sysinfo::System::global_cpu_usage()`, temperature via `/sys/class/hwmon`
-- **RAM**: via `sysinfo::System` (used/total memory)
-- **GPU**: scans `/sys/class/drm/card*/device/` for `gpu_busy_percent` and `temp*_input` (hwmon). Vendor detected by PCI ID.
+```bash
+sudo install -Dm0755 target/release/cosmic-applet-system-monitor /usr/bin/cosmic-applet-system-monitor
+sudo install -Dm0644 resources/com.system76.CosmicAppletSystemMonitor.desktop \
+  /usr/share/applications/com.system76.CosmicAppletSystemMonitor.desktop
+```
+
+Then add the applet to the panel via **Settings → Desktop → Panel → Applets**,
+or edit `~/.config/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings` and
+restart the panel.
+
+## Architecture
+
+The metrics collector ([`SystemMonitor`](src/monitor.rs)) is created **once** and
+reused for the applet's lifetime:
+
+- **CPU** — `sysinfo` computes load from the delta between consecutive refreshes,
+  so the `System` handle must persist across ticks (recreating it per tick yields
+  bogus near-zero readings).
+- **GPU** — sysfs paths and NVML handles are resolved at startup, not per refresh.
+
+Sampling runs on a blocking task (`spawn_blocking`) behind an `Arc<Mutex<…>>`, so
+the synchronous filesystem/NVML reads never block the UI event loop.
+
+## Development
+
+```bash
+just check   # fmt --check + clippy -D warnings + tests
+```
 
 ## License
 
-GPL-3.0-only
+GPL-3.0-only — see [LICENSE](LICENSE).
